@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+import os
+import pandas as pd
+import json
+import re
+import argparse
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import cos_sim
+from tqdm import tqdm
+
+def parse_paper_sections(data):
+    """Extract text from different sections of a paper."""
+    text_list = {}
+    list_intro = []
+    list_rw = []
+    list_results_and_a = []
+    list_method = []
+    
+    title_name = str(data['title']).lower()
+    title_name_split = set(title_name.split())
+    
+    for k in data['pdf_parse']['body_text']:
+        section_name = str(k['section']).lower()
+        sec_num = str(k['sec_num'])
+        section_name_split = set(section_name.split())
+        
+        # Introduction section
+        if 'introduction' in section_name or '1' in sec_num:
+            list_intro.append(k['text'])
+            
+        # Related work section
+        elif 'related work' in section_name or 'related' in section_name or 'work' in section_name:
+            sections = re.findall(rf"{sec_num}.\d", str(k))
+            for j in data['pdf_parse']['body_text']:
+                sec_num_in = str(j['sec_num'])
+                if sec_num_in in sections:
+                    list_rw.append(j['text'])
+            list_rw.append(k['text'])
+            
+        # Method section
+        elif ('method' in section_name or 'methods' in section_name or 
+              'experimental preliminaries' in section_name or 'proposed' in section_name or 
+              section_name in title_name or 
+              len(section_name_split.intersection(title_name_split)) > 1):
+            sections = re.findall(rf"{sec_num}.\d", str(k))
+            for j in data['pdf_parse']['body_text']:
+                sec_num_in = str(j['sec_num'])
+                if sec_num_in in sections:
+                    list_method.append(j['text'])
+            list_method.append(k['text'])
+            
+        # Results section
+        elif ('results' in section_name or 'discussion' in section_name or 
+              'analysis' in section_name or 'implications' in section_name or 
+              'inference' in section_name):
+            sections = re.findall(rf"{sec_num}.\d", str(k))
+            for j in data['pdf_parse']['body_text']:
+                sec_num_in = str(j['sec_num'])
+                if sec_num_in in sections:
+                    list_results_and_a.append(j['text'])
+            list_results_and_a.append(k['text'])
+    
+    text_list[1] = list_intro
+    text_list[2] = list_rw
+    text_list[3] = list_method
+    text_list[5] = list_results_and_a
+    
+    return text_list
+
+def get_embeds(parsed_pds_file):
+    """Process all JSON files in a directory and extract text by sections."""
+    text_list_for_claim = {}
+    
+    for i in tqdm(os.listdir(parsed_pds_file), desc="Processing papers"):
+        if i.endswith(".json"):
+            with open(os.path.join(parsed_pds_file, i), 'r') as f:
+                data = json.load(f)
+            
+            text_list = parse_paper_sections(data)
+            text_list_for_claim[i] = text_list
+    
+    return text_list_for_claim
+
+def create_embeds_from_json(text_list_for_claims, model):
+    """Create embeddings for text sections using the sentence transformer model."""
+    json_preds_list = {}
+    
+    for i, sections in tqdm(text_list_for_claims.items(), desc="Creating embeddings"):
+        dicc = {}
+        for sec_num, texts in sections.items():
+            if texts:
+                dicc[sec_num] = model.encode(texts)
+        
+        json_preds_list[i] = dicc
+    
+    return json_preds_list
+
+def return_sim_sentences(csv_file_claims, json_embeds_list, text_list_for_claims, model, top_n=12):
+    """Find the most similar sentences for each claim."""
+    top_sentences = []
+    
+    for _, row in tqdm(csv_file_claims.iterrows(), total=len(csv_file_claims), desc="Finding similar sentences"):
+        dicc = {}
+        query_embed = model.encode(str(row.Claim))
+        file_name = f'{row.FileNo}.json'
+        
+        if file_name not in json_embeds_list:
+            continue
+            
+        corpus_embeds_list = json_embeds_list[file_name]
+        
+        for sec_num, embeddings in corpus_embeds_list.items():
+            similarities = cos_sim(query_embed, embeddings)
+            top_ids = sorted(range(similarities.shape[1]), key=lambda k: similarities[0][k], reverse=True)[:top_n]
+            
+            top_sentences_claim_wise = [text_list_for_claims[file_name][sec_num][h] for h in top_ids]
+            dicc[sec_num] = top_sentences_claim_wise
+        
+        top_sentences.append(dicc)
+    
+    return top_sentences
+
+def main(args):
+    # Initialize the model
+    print(f"Initializing model: {args.model}")
+    model = SentenceTransformer(args.model, device=args.device)
+    
+    # Process JSON files
+    print(f"Processing papers from: {args.parsed_dir}")
+    text_list_for_claims = get_embeds(args.parsed_dir)
+    
+    # Create embeddings
+    print("Creating embeddings...")
+    json_embeds_list = create_embeds_from_json(text_list_for_claims, model)
+    
+    # Load claims
+    print(f"Loading claims from: {args.claims_file}")
+    csv_claim_files = pd.read_csv(args.claims_file)
+    
+    # Find similar sentences
+    print(f"Finding top {args.top_n} similar sentences for each claim...")
+    top_sentences = return_sim_sentences(
+        csv_claim_files, 
+        json_embeds_list, 
+        text_list_for_claims, 
+        model,
+        top_n=args.top_n
+    )
+    
+    # Create dataframe with results
+    df_part = pd.DataFrame(top_sentences)
+    df_part = df_part.rename(columns={
+        1: 'Introduction',
+        2: 'Related Work',
+        3: 'Proposed Method',
+        5: 'Results and Analysis'
+    })
+    
+    # Combine with original claims
+    total_df = pd.concat([csv_claim_files, df_part], axis=1)
+    
+    # Save results
+    print(f"Saving results to: {args.output_file}")
+    total_df.to_csv(args.output_file, index=False)
+    print("Done!")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Extract and match similar sentences from papers to claims')
+    
+    parser.add_argument('--parsed_dir', type=str, default='Parsed_pds/',
+                        help='Directory containing parsed paper JSON files')
+    parser.add_argument('--claims_file', type=str, default='new_environ/Final_dataset.csv',
+                        help='CSV file containing claims')
+    parser.add_argument('--output_file', type=str, default='results.csv',
+                        help='Output file path for results')
+    parser.add_argument('--model', type=str, default='all-MiniLM-L6-v2',
+                        help='Sentence transformer model to use')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device to run the model on (cuda or cpu)')
+    parser.add_argument('--top_n', type=int, default=12,
+                        help='Number of top similar sentences to extract')
+    
+    args = parser.parse_args()
+    main(args)
